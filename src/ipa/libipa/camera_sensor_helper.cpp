@@ -667,6 +667,18 @@ public:
 };
 REGISTER_CAMERA_SENSOR_HELPER("ov2685", CameraSensorHelperOv2685)
 
+class CameraSensorHelperOv01a10 : public CameraSensorHelper
+{
+public:
+	CameraSensorHelperOv01a10()
+	{
+		/* From datasheet and aiqb: 0x40 (64) at 10-bit. */
+		blackLevel_ = 4096;
+		gain_ = AnalogueGainLinear{ 1, 0, 0, 256 };
+	}
+};
+REGISTER_CAMERA_SENSOR_HELPER("ov01a10", CameraSensorHelperOv01a10)
+
 class CameraSensorHelperOv2740 : public CameraSensorHelper
 {
 public:
