@@ -77,6 +77,10 @@ public:
 			icamera::camera_device_close(cameraId_);
 			deviceOpened_ = false;
 		}
+		for (unsigned int i = 0; i < kNumHalBuffers; i++) {
+			free(halBuffers_[i].addr);
+			halBuffers_[i].addr = nullptr;
+		}
 	}
 
 	int init(int cameraId);
@@ -99,15 +103,20 @@ public:
 	std::mutex queueMutex_;
 	std::queue<Request *> pendingRequests_;
 	bool workerStop_ = false;
+	uint32_t frameSequence_ = 0;
 
 	/* HAL stream info filled by config_streams */
 	icamera::stream_t halStream_;
 	int halStreamId_ = -1;
 
-	/* Internal buffer for receiving frames from HAL */
-	void *halBufferAddr_ = nullptr;
-	int halBufferSize_ = 0;
-	icamera::camera_buffer_t halBuffer_;
+	/* Internal buffers for receiving frames from HAL */
+	static constexpr unsigned int kNumHalBuffers = 4;
+	struct HalBuffer {
+		void *addr = nullptr;
+		int size = 0;
+		icamera::camera_buffer_t buf;
+	};
+	HalBuffer halBuffers_[kNumHalBuffers];
 };
 
 class IPU6CameraConfiguration : public CameraConfiguration
@@ -237,22 +246,25 @@ int IPU6CameraData::configureHalStream(const Size &size)
 	halStreamId_ = halStream_.id;
 	configuredSize_ = size;
 	/* Update size/stride from what HAL returned (may have been adjusted) */
-	halBufferSize_ = halStream_.size ? halStream_.size
-					 : size.width * size.height * 3 / 2;
+	int bufSize = halStream_.size ? halStream_.size
+				      : size.width * size.height * 3 / 2;
 
 	LOG(IPU6, Info) << "Configured HAL stream: " << size.width << "x"
 			<< size.height << " NV12, stream_id=" << halStreamId_
-			<< " size=" << halBufferSize_;
+			<< " size=" << bufSize;
 
-	/* Allocate internal buffer for HAL frames */
-	if (halBufferAddr_) {
-		free(halBufferAddr_);
-		halBufferAddr_ = nullptr;
-	}
+	/* Allocate internal buffers for HAL frames */
+	for (unsigned int i = 0; i < kNumHalBuffers; i++) {
+		if (halBuffers_[i].addr) {
+			free(halBuffers_[i].addr);
+			halBuffers_[i].addr = nullptr;
+		}
 
-	if (posix_memalign(&halBufferAddr_, getpagesize(), halBufferSize_) != 0) {
-		LOG(IPU6, Error) << "Failed to allocate HAL buffer";
-		return -ENOMEM;
+		if (posix_memalign(&halBuffers_[i].addr, getpagesize(), bufSize) != 0) {
+			LOG(IPU6, Error) << "Failed to allocate HAL buffer " << i;
+			return -ENOMEM;
+		}
+		halBuffers_[i].size = bufSize;
 	}
 
 	return 0;
@@ -263,21 +275,22 @@ int IPU6CameraData::startStreaming()
 	if (streaming_)
 		return 0;
 
-	/* Prepare the HAL buffer */
-	memset(&halBuffer_, 0, sizeof(halBuffer_));
-	halBuffer_.s = halStream_;
-	halBuffer_.addr = halBufferAddr_;
-	halBuffer_.flags = 0;
+	/* Prepare and queue all HAL buffers */
+	for (unsigned int i = 0; i < kNumHalBuffers; i++) {
+		memset(&halBuffers_[i].buf, 0, sizeof(halBuffers_[i].buf));
+		halBuffers_[i].buf.s = halStream_;
+		halBuffers_[i].buf.addr = halBuffers_[i].addr;
+		halBuffers_[i].buf.flags = 0;
 
-	/* Queue initial buffer */
-	icamera::camera_buffer_t *bufPtr = &halBuffer_;
-	int ret = icamera::camera_stream_qbuf(cameraId_, &bufPtr, 1, nullptr);
-	if (ret < 0) {
-		LOG(IPU6, Error) << "Failed to queue initial HAL buffer: " << ret;
-		return ret;
+		icamera::camera_buffer_t *bufPtr = &halBuffers_[i].buf;
+		int qret = icamera::camera_stream_qbuf(cameraId_, &bufPtr, 1, nullptr);
+		if (qret < 0) {
+			LOG(IPU6, Error) << "Failed to queue HAL buffer " << i << ": " << qret;
+			return qret;
+		}
 	}
 
-	ret = icamera::camera_device_start(cameraId_);
+	int ret = icamera::camera_device_start(cameraId_);
 	if (ret < 0) {
 		LOG(IPU6, Error) << "Failed to start camera device: " << ret;
 		return ret;
@@ -332,11 +345,13 @@ void IPU6CameraData::workerThread()
 
 		/* Dequeue a frame from HAL (blocking call) */
 		icamera::camera_buffer_t *dqBuf = nullptr;
+		LOG(IPU6, Debug) << "Calling dqbuf...";
 		int ret = icamera::camera_stream_dqbuf(cameraId_, halStreamId_, &dqBuf);
 		if (ret < 0) {
 			LOG(IPU6, Error) << "dqbuf failed: " << ret;
 			break;
 		}
+		LOG(IPU6, Debug) << "dqbuf ok, addr=" << (dqBuf ? dqBuf->addr : nullptr);
 
 		/* Get a pending request */
 		Request *request = nullptr;
@@ -350,7 +365,7 @@ void IPU6CameraData::workerThread()
 			}
 		}
 
-		if (request) {
+		if (request && dqBuf) {
 			/* Copy HAL buffer data into the libcamera FrameBuffer */
 			FrameBuffer *buffer = request->findBuffer(&stream_);
 			if (buffer) {
@@ -363,10 +378,10 @@ void IPU6CameraData::workerThread()
 						totalSize += plane.size();
 
 					size_t copySize = std::min(totalSize,
-								   static_cast<size_t>(halBufferSize_));
+								   static_cast<size_t>(dqBuf->s.size));
 
 					/* Copy plane by plane */
-					uint8_t *src = static_cast<uint8_t *>(halBufferAddr_);
+					uint8_t *src = static_cast<uint8_t *>(dqBuf->addr);
 					size_t offset = 0;
 					for (const auto &plane : planes) {
 						size_t planeBytes = std::min(plane.size(),
@@ -381,8 +396,10 @@ void IPU6CameraData::workerThread()
 				/* Fill buffer metadata */
 				FrameMetadata &metadata = buffer->_d()->metadata();
 				metadata.status = FrameMetadata::FrameSuccess;
-				metadata.sequence = dqBuf ? dqBuf->sequence : 0;
-				metadata.timestamp = dqBuf ? dqBuf->timestamp : 0;
+				metadata.sequence = frameSequence_++;
+				auto now = std::chrono::steady_clock::now();
+				metadata.timestamp = std::chrono::duration_cast<std::chrono::nanoseconds>(
+					now.time_since_epoch()).count();
 
 				/* Set plane bytesused */
 				unsigned int yPlaneSize = configuredSize_.width * configuredSize_.height;
@@ -396,25 +413,29 @@ void IPU6CameraData::workerThread()
 
 				/* Set sensor timestamp */
 				request->_d()->metadata().set(controls::SensorTimestamp,
-							     dqBuf ? static_cast<int64_t>(dqBuf->timestamp) : 0);
+							     metadata.timestamp);
 
 				pipe()->completeBuffer(request, buffer);
 				pipe()->completeRequest(request);
 			}
 		}
 
-		/* Re-queue the buffer to HAL for next frame */
-		{
-			std::lock_guard<std::mutex> lock(queueMutex_);
-			if (workerStop_)
-				break;
-		}
+		/* Re-queue the dequeued buffer to HAL */
+		if (dqBuf) {
+			{
+				std::lock_guard<std::mutex> lock(queueMutex_);
+				if (workerStop_)
+					break;
+			}
 
-		icamera::camera_buffer_t *bufPtr = &halBuffer_;
-		ret = icamera::camera_stream_qbuf(cameraId_, &bufPtr, 1, nullptr);
-		if (ret < 0) {
-			LOG(IPU6, Error) << "qbuf failed: " << ret;
-			break;
+			LOG(IPU6, Debug) << "Re-queueing buffer addr=" << dqBuf->addr;
+			icamera::camera_buffer_t *bufPtr = dqBuf;
+			ret = icamera::camera_stream_qbuf(cameraId_, &bufPtr, 1, nullptr);
+			if (ret < 0) {
+				LOG(IPU6, Error) << "qbuf failed: " << ret;
+				break;
+			}
+			LOG(IPU6, Debug) << "qbuf ok";
 		}
 	}
 
