@@ -1,0 +1,24 @@
+# SPDX-License-Identifier: CC0-1.0
+#
+# Tuning file for OmniVision OV01A10 (1.3MP, 1280x800, SBGGR10)
+# For use with libcamera simple/soft ISP pipeline
+#
+# Uses identity CCM — the AIQB-derived CCMs cause green tint with
+# the soft ISP's simple AWB. Saturation boost requires CCM enabled,
+# so we keep an identity matrix at a single color temperature.
+%YAML 1.1
+---
+version: 1
+algorithms:
+  - BlackLevel:
+      black: 16
+  - Awb:
+  - Ccm:
+      ccms:
+        - ct: 5000
+          ccm: [ 1.0, 0.0, 0.0,
+                 0.0, 1.0, 0.0,
+                 0.0, 0.0, 1.0 ]
+  - Adjust:
+  - Agc:
+...
