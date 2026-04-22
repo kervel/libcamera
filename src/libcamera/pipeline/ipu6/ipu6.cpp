@@ -15,6 +15,7 @@
 #include <cstring>
 #include <map>
 #include <memory>
+#include <condition_variable>
 #include <mutex>
 #include <queue>
 #include <string>
@@ -77,10 +78,8 @@ public:
 			icamera::camera_device_close(cameraId_);
 			deviceOpened_ = false;
 		}
-		for (unsigned int i = 0; i < kNumHalBuffers; i++) {
-			free(halBuffers_[i].addr);
-			halBuffers_[i].addr = nullptr;
-		}
+		free(halBufferAddr_);
+		halBufferAddr_ = nullptr;
 	}
 
 	int init(int cameraId);
@@ -98,25 +97,24 @@ public:
 	Stream stream_;
 	Size configuredSize_;
 
-	/* Worker thread for qbuf/dqbuf to libcamhal */
+	/* Worker thread continuously dqbufs from HAL and delivers */
 	std::thread worker_;
 	std::mutex queueMutex_;
+	std::condition_variable requestCv_;
 	std::queue<Request *> pendingRequests_;
 	bool workerStop_ = false;
 	uint32_t frameSequence_ = 0;
+
+	void deliverFrame(Request *request, void *src, size_t srcSize);
 
 	/* HAL stream info filled by config_streams */
 	icamera::stream_t halStream_;
 	int halStreamId_ = -1;
 
-	/* Internal buffers for receiving frames from HAL */
-	static constexpr unsigned int kNumHalBuffers = 4;
-	struct HalBuffer {
-		void *addr = nullptr;
-		int size = 0;
-		icamera::camera_buffer_t buf;
-	};
-	HalBuffer halBuffers_[kNumHalBuffers];
+	/* Single HAL buffer */
+	void *halBufferAddr_ = nullptr;
+	int halBufferSize_ = 0;
+	icamera::camera_buffer_t halBuffer_;
 };
 
 class IPU6CameraConfiguration : public CameraConfiguration
@@ -253,18 +251,17 @@ int IPU6CameraData::configureHalStream(const Size &size)
 			<< size.height << " NV12, stream_id=" << halStreamId_
 			<< " size=" << bufSize;
 
-	/* Allocate internal buffers for HAL frames */
-	for (unsigned int i = 0; i < kNumHalBuffers; i++) {
-		if (halBuffers_[i].addr) {
-			free(halBuffers_[i].addr);
-			halBuffers_[i].addr = nullptr;
-		}
+	halBufferSize_ = bufSize;
 
-		if (posix_memalign(&halBuffers_[i].addr, getpagesize(), bufSize) != 0) {
-			LOG(IPU6, Error) << "Failed to allocate HAL buffer " << i;
-			return -ENOMEM;
-		}
-		halBuffers_[i].size = bufSize;
+	/* Allocate internal buffer for HAL frames */
+	if (halBufferAddr_) {
+		free(halBufferAddr_);
+		halBufferAddr_ = nullptr;
+	}
+
+	if (posix_memalign(&halBufferAddr_, getpagesize(), halBufferSize_) != 0) {
+		LOG(IPU6, Error) << "Failed to allocate HAL buffer";
+		return -ENOMEM;
 	}
 
 	return 0;
@@ -275,19 +272,17 @@ int IPU6CameraData::startStreaming()
 	if (streaming_)
 		return 0;
 
-	/* Prepare and queue all HAL buffers */
-	for (unsigned int i = 0; i < kNumHalBuffers; i++) {
-		memset(&halBuffers_[i].buf, 0, sizeof(halBuffers_[i].buf));
-		halBuffers_[i].buf.s = halStream_;
-		halBuffers_[i].buf.addr = halBuffers_[i].addr;
-		halBuffers_[i].buf.flags = 0;
+	/* Prepare and queue the HAL buffer before start */
+	memset(&halBuffer_, 0, sizeof(halBuffer_));
+	halBuffer_.s = halStream_;
+	halBuffer_.addr = halBufferAddr_;
+	halBuffer_.flags = 0;
 
-		icamera::camera_buffer_t *bufPtr = &halBuffers_[i].buf;
-		int qret = icamera::camera_stream_qbuf(cameraId_, &bufPtr, 1, nullptr);
-		if (qret < 0) {
-			LOG(IPU6, Error) << "Failed to queue HAL buffer " << i << ": " << qret;
-			return qret;
-		}
+	icamera::camera_buffer_t *bufPtr = &halBuffer_;
+	int qret = icamera::camera_stream_qbuf(cameraId_, &bufPtr, 1, nullptr);
+	if (qret < 0) {
+		LOG(IPU6, Error) << "Failed to queue initial HAL buffer: " << qret;
+		return qret;
 	}
 
 	int ret = icamera::camera_device_start(cameraId_);
@@ -316,6 +311,7 @@ void IPU6CameraData::stopStreaming()
 		std::lock_guard<std::mutex> lock(queueMutex_);
 		workerStop_ = true;
 	}
+	requestCv_.notify_all();
 
 	if (worker_.joinable())
 		worker_.join();
@@ -327,119 +323,112 @@ void IPU6CameraData::stopStreaming()
 	std::lock_guard<std::mutex> lock(queueMutex_);
 	while (!pendingRequests_.empty())
 		pendingRequests_.pop();
+	frameSequence_ = 0;
 
 	LOG(IPU6, Info) << "Streaming stopped for camera " << cameraId_;
 }
 
-void IPU6CameraData::workerThread()
+void IPU6CameraData::deliverFrame(Request *request, void *src, size_t srcSize)
 {
-	LOG(IPU6, Debug) << "Worker thread started";
+	FrameBuffer *buffer = request->findBuffer(&stream_);
+	if (!buffer)
+		return;
 
-	while (true) {
-		/* Check for stop */
-		{
-			std::lock_guard<std::mutex> lock(queueMutex_);
-			if (workerStop_)
-				break;
-		}
+	MappedFrameBuffer mapped(buffer, MappedFrameBuffer::MapFlag::Write);
+	if (!mapped.isValid())
+		return;
 
-		/* Dequeue a frame from HAL (blocking call) */
-		icamera::camera_buffer_t *dqBuf = nullptr;
-		LOG(IPU6, Debug) << "Calling dqbuf...";
-		int ret = icamera::camera_stream_dqbuf(cameraId_, halStreamId_, &dqBuf);
-		if (ret < 0) {
-			LOG(IPU6, Error) << "dqbuf failed: " << ret;
+	const auto &planes = mapped.planes();
+	size_t totalSize = 0;
+	for (const auto &plane : planes)
+		totalSize += plane.size();
+
+	size_t copySize = std::min(totalSize, srcSize);
+	uint8_t *srcPtr = static_cast<uint8_t *>(src);
+	size_t offset = 0;
+	for (const auto &plane : planes) {
+		size_t planeBytes = std::min(plane.size(), copySize - offset);
+		memcpy(plane.data(), srcPtr + offset, planeBytes);
+		offset += planeBytes;
+		if (offset >= copySize)
 			break;
-		}
-		LOG(IPU6, Debug) << "dqbuf ok, addr=" << (dqBuf ? dqBuf->addr : nullptr);
-
-		/* Get a pending request */
-		Request *request = nullptr;
-		{
-			std::lock_guard<std::mutex> lock(queueMutex_);
-			if (workerStop_)
-				break;
-			if (!pendingRequests_.empty()) {
-				request = pendingRequests_.front();
-				pendingRequests_.pop();
-			}
-		}
-
-		if (request && dqBuf) {
-			/* Copy HAL buffer data into the libcamera FrameBuffer */
-			FrameBuffer *buffer = request->findBuffer(&stream_);
-			if (buffer) {
-				MappedFrameBuffer mapped(buffer,
-							 MappedFrameBuffer::MapFlag::Write);
-				if (mapped.isValid()) {
-					const auto &planes = mapped.planes();
-					size_t totalSize = 0;
-					for (const auto &plane : planes)
-						totalSize += plane.size();
-
-					size_t copySize = std::min(totalSize,
-								   static_cast<size_t>(dqBuf->s.size));
-
-					/* Copy plane by plane */
-					uint8_t *src = static_cast<uint8_t *>(dqBuf->addr);
-					size_t offset = 0;
-					for (const auto &plane : planes) {
-						size_t planeBytes = std::min(plane.size(),
-									     copySize - offset);
-						memcpy(plane.data(), src + offset, planeBytes);
-						offset += planeBytes;
-						if (offset >= copySize)
-							break;
-					}
-				}
-
-				/* Fill buffer metadata */
-				FrameMetadata &metadata = buffer->_d()->metadata();
-				metadata.status = FrameMetadata::FrameSuccess;
-				metadata.sequence = frameSequence_++;
-				auto now = std::chrono::steady_clock::now();
-				metadata.timestamp = std::chrono::duration_cast<std::chrono::nanoseconds>(
-					now.time_since_epoch()).count();
-
-				/* Set plane bytesused */
-				unsigned int yPlaneSize = configuredSize_.width * configuredSize_.height;
-				unsigned int uvPlaneSize = yPlaneSize / 2;
-				if (metadata.planes().size() >= 2) {
-					metadata.planes()[0].bytesused = yPlaneSize;
-					metadata.planes()[1].bytesused = uvPlaneSize;
-				} else if (metadata.planes().size() == 1) {
-					metadata.planes()[0].bytesused = yPlaneSize + uvPlaneSize;
-				}
-
-				/* Set sensor timestamp */
-				request->_d()->metadata().set(controls::SensorTimestamp,
-							     metadata.timestamp);
-
-				pipe()->completeBuffer(request, buffer);
-				pipe()->completeRequest(request);
-			}
-		}
-
-		/* Re-queue the dequeued buffer to HAL */
-		if (dqBuf) {
-			{
-				std::lock_guard<std::mutex> lock(queueMutex_);
-				if (workerStop_)
-					break;
-			}
-
-			LOG(IPU6, Debug) << "Re-queueing buffer addr=" << dqBuf->addr;
-			icamera::camera_buffer_t *bufPtr = dqBuf;
-			ret = icamera::camera_stream_qbuf(cameraId_, &bufPtr, 1, nullptr);
-			if (ret < 0) {
-				LOG(IPU6, Error) << "qbuf failed: " << ret;
-				break;
-			}
-			LOG(IPU6, Debug) << "qbuf ok";
-		}
 	}
 
-	LOG(IPU6, Debug) << "Worker thread exiting";
+	FrameMetadata &metadata = buffer->_d()->metadata();
+	metadata.status = FrameMetadata::FrameSuccess;
+	metadata.sequence = frameSequence_++;
+	auto now = std::chrono::steady_clock::now();
+	metadata.timestamp = std::chrono::duration_cast<std::chrono::nanoseconds>(
+		now.time_since_epoch()).count();
+
+	unsigned int yPlaneSize = configuredSize_.width * configuredSize_.height;
+	unsigned int uvPlaneSize = yPlaneSize / 2;
+	if (metadata.planes().size() >= 2) {
+		metadata.planes()[0].bytesused = yPlaneSize;
+		metadata.planes()[1].bytesused = uvPlaneSize;
+	} else if (metadata.planes().size() == 1) {
+		metadata.planes()[0].bytesused = yPlaneSize + uvPlaneSize;
+	}
+
+	request->_d()->metadata().set(controls::SensorTimestamp, metadata.timestamp);
+	pipe()->completeBuffer(request, buffer);
+	pipe()->completeRequest(request);
+}
+
+void IPU6CameraData::workerThread()
+{
+	LOG(IPU6, Info) << "Worker thread started";
+
+	while (true) {
+		/* Dqbuf: get the frame the HAL filled (blocks until ready) */
+		icamera::camera_buffer_t *dqBuf = nullptr;
+		LOG(IPU6, Info) << "Worker: dqbuf...";
+		int ret = icamera::camera_stream_dqbuf(cameraId_, halStreamId_, &dqBuf);
+		if (ret < 0) {
+			std::lock_guard<std::mutex> lock(queueMutex_);
+			if (workerStop_) {
+				LOG(IPU6, Info) << "Worker: dqbuf interrupted by stop";
+				break;
+			}
+			LOG(IPU6, Error) << "Worker: dqbuf failed: " << ret;
+			break;
+		}
+		LOG(IPU6, Info) << "Worker: dqbuf ok";
+
+		/* Wait for a request to deliver this frame to */
+		Request *request = nullptr;
+		{
+			std::unique_lock<std::mutex> lock(queueMutex_);
+			LOG(IPU6, Info) << "Worker: waiting for request, pending=" << pendingRequests_.size();
+			requestCv_.wait(lock, [this] {
+				return workerStop_ || !pendingRequests_.empty();
+			});
+			if (workerStop_) {
+				LOG(IPU6, Info) << "Worker: stop signaled";
+				break;
+			}
+			request = pendingRequests_.front();
+			pendingRequests_.pop();
+		}
+
+		/* Deliver the frame */
+		LOG(IPU6, Info) << "Worker: delivering frame " << frameSequence_;
+		if (dqBuf)
+			deliverFrame(request, dqBuf->addr, dqBuf->s.size);
+		LOG(IPU6, Info) << "Worker: frame delivered";
+
+		/* Re-queue buffer for next frame */
+		LOG(IPU6, Info) << "Worker: qbuf...";
+		icamera::camera_buffer_t *bufPtr = &halBuffer_;
+		ret = icamera::camera_stream_qbuf(cameraId_, &bufPtr, 1, nullptr);
+		if (ret < 0) {
+			LOG(IPU6, Error) << "Worker: qbuf failed: " << ret;
+			break;
+		}
+		LOG(IPU6, Info) << "Worker: qbuf ok";
+	}
+
+	LOG(IPU6, Info) << "Worker thread exiting";
 }
 
 /* --- IPU6CameraConfiguration --- */
@@ -599,8 +588,11 @@ int PipelineHandlerIPU6::queueRequestDevice(Camera *camera, Request *request)
 		return -ENOENT;
 	}
 
-	std::lock_guard<std::mutex> lock(data->queueMutex_);
-	data->pendingRequests_.push(request);
+	{
+		std::lock_guard<std::mutex> lock(data->queueMutex_);
+		data->pendingRequests_.push(request);
+	}
+	data->requestCv_.notify_one();
 
 	return 0;
 }
