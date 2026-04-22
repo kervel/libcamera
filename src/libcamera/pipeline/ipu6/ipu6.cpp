@@ -104,10 +104,14 @@ public:
 	icamera::stream_t halStream_;
 	int halStreamId_ = -1;
 
-	/* Internal buffer for receiving frames from HAL */
-	void *halBufferAddr_ = nullptr;
+	/* Two internal buffers — HAL needs one queued while we process the other */
+	static constexpr int kNumBufs = 2;
+	void *halBufferAddr_[kNumBufs] = {};
 	int halBufferSize_ = 0;
-	icamera::camera_buffer_t halBuffer_;
+	icamera::camera_buffer_t halBuffer_[kNumBufs];
+
+	/* Per-frame 3A parameters passed with each qbuf */
+	icamera::Parameters halParams_;
 };
 
 class IPU6CameraConfiguration : public CameraConfiguration
@@ -210,6 +214,11 @@ int IPU6CameraData::configureHalStream(const Size &size)
 		}
 		deviceOpened_ = true;
 		LOG(IPU6, Info) << "Camera device " << cameraId_ << " opened successfully";
+
+		/* Set 3A parameters — HAL won't process new frames without this */
+		halParams_.setAeMode(icamera::AE_MODE_AUTO);
+		halParams_.setAntiBandingMode(icamera::ANTIBANDING_MODE_AUTO);
+		icamera::camera_set_parameters(cameraId_, halParams_);
 	}
 
 	/* Configure the output stream */
@@ -244,15 +253,18 @@ int IPU6CameraData::configureHalStream(const Size &size)
 			<< size.height << " NV12, stream_id=" << halStreamId_
 			<< " size=" << halBufferSize_;
 
-	/* Allocate internal buffer for HAL frames */
-	if (halBufferAddr_) {
-		free(halBufferAddr_);
-		halBufferAddr_ = nullptr;
-	}
-
-	if (posix_memalign(&halBufferAddr_, getpagesize(), halBufferSize_) != 0) {
-		LOG(IPU6, Error) << "Failed to allocate HAL buffer";
-		return -ENOMEM;
+	/* Allocate internal buffers for HAL frames */
+	for (int i = 0; i < kNumBufs; i++) {
+		free(halBufferAddr_[i]);
+		halBufferAddr_[i] = nullptr;
+		if (posix_memalign(&halBufferAddr_[i], getpagesize(), halBufferSize_) != 0) {
+			LOG(IPU6, Error) << "Failed to allocate HAL buffer " << i;
+			return -ENOMEM;
+		}
+		memset(&halBuffer_[i], 0, sizeof(halBuffer_[i]));
+		halBuffer_[i].s = halStream_;
+		halBuffer_[i].addr = halBufferAddr_[i];
+		halBuffer_[i].flags = 0;
 	}
 
 	return 0;
@@ -263,21 +275,20 @@ int IPU6CameraData::startStreaming()
 	if (streaming_)
 		return 0;
 
-	/* Prepare the HAL buffer */
-	memset(&halBuffer_, 0, sizeof(halBuffer_));
-	halBuffer_.s = halStream_;
-	halBuffer_.addr = halBufferAddr_;
-	halBuffer_.flags = 0;
-
-	/* Queue initial buffer */
-	icamera::camera_buffer_t *bufPtr = &halBuffer_;
-	int ret = icamera::camera_stream_qbuf(cameraId_, &bufPtr, 1, nullptr);
-	if (ret < 0) {
-		LOG(IPU6, Error) << "Failed to queue initial HAL buffer: " << ret;
-		return ret;
+	/* Queue both buffers before starting */
+	for (int i = 0; i < kNumBufs; i++) {
+		halBuffer_[i].flags = 0;
+		halBuffer_[i].sequence = -1;
+		halBuffer_[i].timestamp = 0;
+		icamera::camera_buffer_t *bufPtr = &halBuffer_[i];
+		int qret = icamera::camera_stream_qbuf(cameraId_, &bufPtr, 1, &halParams_);
+		if (qret < 0) {
+			LOG(IPU6, Error) << "Failed to queue HAL buffer " << i << ": " << qret;
+			return qret;
+		}
 	}
 
-	ret = icamera::camera_device_start(cameraId_);
+	int ret = icamera::camera_device_start(cameraId_);
 	if (ret < 0) {
 		LOG(IPU6, Error) << "Failed to start camera device: " << ret;
 		return ret;
@@ -366,7 +377,7 @@ void IPU6CameraData::workerThread()
 								   static_cast<size_t>(halBufferSize_));
 
 					/* Copy plane by plane */
-					uint8_t *src = static_cast<uint8_t *>(halBufferAddr_);
+					uint8_t *src = static_cast<uint8_t *>(dqBuf->addr);
 					size_t offset = 0;
 					for (const auto &plane : planes) {
 						size_t planeBytes = std::min(plane.size(),
@@ -410,8 +421,13 @@ void IPU6CameraData::workerThread()
 				break;
 		}
 
-		icamera::camera_buffer_t *bufPtr = &halBuffer_;
-		ret = icamera::camera_stream_qbuf(cameraId_, &bufPtr, 1, nullptr);
+		/* Reset buffer fields before re-queue (as icamerasrc does) */
+		icamera::camera_set_parameters(cameraId_, halParams_);
+		dqBuf->sequence = -1;
+		dqBuf->timestamp = 0;
+
+		icamera::camera_buffer_t *bufPtr = dqBuf;
+		ret = icamera::camera_stream_qbuf(cameraId_, &bufPtr, 1, &halParams_);
 		if (ret < 0) {
 			LOG(IPU6, Error) << "qbuf failed: " << ret;
 			break;
