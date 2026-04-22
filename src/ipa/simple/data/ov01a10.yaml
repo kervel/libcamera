@@ -1,32 +1,24 @@
 # SPDX-License-Identifier: CC0-1.0
 #
-# Tuning file for OmniVision OV01A10 (1.3MP, 1280x800)
+# Tuning file for OmniVision OV01A10 (1.3MP, 1280x800, SBGGR10)
 # For use with libcamera simple/soft ISP pipeline
 #
-# CCM data extracted from Dell Latitude 9320 (Tributo) aiqb profile
-# (Dell_Tributo_OV01A_Release_ww50_4, created 2021-12-07 with IQStudio 21.45).
+# Uses identity CCM — the AIQB-derived CCMs cause green tint with
+# the soft ISP's simple AWB. Saturation boost requires CCM enabled,
+# so we keep an identity matrix at a single color temperature.
 %YAML 1.1
 ---
 version: 1
 algorithms:
+  - BlackLevel:
+      black: 16
   - Awb:
   - Ccm:
       ccms:
-        - ct: 2800
-          ccm: [  0.9886,  0.5896, -0.5783,
-                 -0.4999,  1.3190,  0.1809,
-                 -0.7300, -0.5693,  2.2993 ]
-        - ct: 4000
-          ccm: [  1.1247,  0.0819, -0.2066,
-                 -0.7007,  2.0684, -0.3677,
-                 -0.4059, -1.7790,  3.1848 ]
         - ct: 5000
-          ccm: [  1.5720, -0.8123,  0.2403,
-                 -0.1407,  0.9484,  0.1923,
-                 -0.3426, -1.9057,  3.2483 ]
-        - ct: 6500
-          ccm: [  1.7045, -0.8785,  0.1740,
-                 -0.5693,  1.1627,  0.4066,
-                  0.0676, -2.1108,  3.0432 ]
+          ccm: [ 1.0, 0.0, 0.0,
+                 0.0, 1.0, 0.0,
+                 0.0, 0.0, 1.0 ]
+  - Adjust:
   - Agc:
 ...

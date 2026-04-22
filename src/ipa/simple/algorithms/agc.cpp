@@ -35,7 +35,7 @@ static constexpr float kExposureOptimal = kExposureBinsCount / 2.0;
  * It is small enough to have the exposure close to the optimal, and is big
  * enough to prevent the exposure from wobbling around the optimal value.
  */
-static constexpr float kExposureSatisfactory = 0.2;
+static constexpr float kExposureSatisfactory = 0.6;
 
 Agc::Agc()
 {
@@ -47,7 +47,7 @@ void Agc::updateExposure(IPAContext &context, IPAFrameContext &frameContext, dou
 	 * kExpDenominator of 10 gives ~10% increment/decrement;
 	 * kExpDenominator of 5 - about ~20%
 	 */
-	static constexpr uint8_t kExpDenominator = 10;
+	static constexpr uint8_t kExpDenominator = 40;
 	static constexpr uint8_t kExpNumeratorUp = kExpDenominator + 1;
 	static constexpr uint8_t kExpNumeratorDown = kExpDenominator - 1;
 
