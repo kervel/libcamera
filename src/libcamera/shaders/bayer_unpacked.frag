@@ -24,6 +24,7 @@ uniform sampler2D       tex_y;
 varying vec4            center;
 varying vec4            yCoord;
 varying vec4            xCoord;
+uniform vec2            tex_step;
 uniform mat3            ccm;
 uniform vec3            blacklevel;
 uniform float           gamma;
@@ -51,7 +52,34 @@ void main(void) {
     #define fetch(x, y) texture2D(tex_y, vec2(x, y)).r
     #endif
 
-    float C = fetch(center.x, center.y); // ( 0, 0)
+    float C_raw = fetch(center.x, center.y); // ( 0, 0)
+
+    /*
+     * Pre-demosaic denoise: average with same-color Bayer neighbors
+     * at distance ±2 (which are the same color phase in any Bayer pattern).
+     * Only include neighbors within a threshold to preserve edges.
+     */
+    {
+        const float dnThresh = 0.08;
+        const float dnWeight = 0.35;
+        float n0 = fetch(center.x, center.y - 2.0 * tex_step.y); // (0, -2)
+        float n1 = fetch(center.x, center.y + 2.0 * tex_step.y); // (0, +2)
+        float n2 = fetch(center.x - 2.0 * tex_step.x, center.y); // (-2, 0)
+        float n3 = fetch(center.x + 2.0 * tex_step.x, center.y); // (+2, 0)
+
+        float sum = C_raw;
+        float wt = 1.0;
+        float d;
+
+        d = abs(n0 - C_raw); if (d < dnThresh) { float w = dnWeight * (1.0 - d/dnThresh); sum += n0 * w; wt += w; }
+        d = abs(n1 - C_raw); if (d < dnThresh) { float w = dnWeight * (1.0 - d/dnThresh); sum += n1 * w; wt += w; }
+        d = abs(n2 - C_raw); if (d < dnThresh) { float w = dnWeight * (1.0 - d/dnThresh); sum += n2 * w; wt += w; }
+        d = abs(n3 - C_raw); if (d < dnThresh) { float w = dnWeight * (1.0 - d/dnThresh); sum += n3 * w; wt += w; }
+
+        C_raw = sum / wt;
+    }
+
+    float C = C_raw;
     const vec4 kC = vec4( 4.0,  6.0,  5.0,  5.0) / 8.0;
 
     // Determine which of four types of pixels we are on.

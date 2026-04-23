@@ -101,9 +101,10 @@ void Adjust::prepare(IPAContext &context,
 	frameContext.contrast = context.activeState.knobs.contrast;
 
 	auto &saturation = context.activeState.knobs.saturation;
-	if (context.ccmEnabled && saturation) {
-		applySaturation(context.activeState.combinedMatrix, saturation.value());
-		frameContext.saturation = saturation;
+	float sat = saturation.value_or(1.25f);
+	if (context.ccmEnabled) {
+		applySaturation(context.activeState.combinedMatrix, sat);
+		frameContext.saturation = sat;
 	}
 
 	params->gamma = 1.0 / context.activeState.knobs.gamma;
