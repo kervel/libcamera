@@ -197,6 +197,26 @@ int IPU6CameraData::init(int cameraId)
 	properties_.set(properties::PixelArrayActiveAreas,
 			{ Rectangle(maxSize) });
 
+	/*
+	 * Advertise a FrameDurationLimits range so PipeWire's libcamera
+	 * monitor can tell clients the actual supported framerate. Without
+	 * this, pipewire reports `@0` fps in the format caps, which at best
+	 * confuses picky clients (Chrome's VideoCapturePipewire divides-by-
+	 * zero in its pacing setup on resubscribe) and at worst trips latent
+	 * teardown bugs in them.
+	 *
+	 * IPU6 + OV01A10 tops out at 30 fps at 1280x720; expose that as the
+	 * lower duration bound and 100 ms (10 fps) as the upper bound.
+	 * Units are microseconds.
+	 */
+	{
+		ControlInfoMap::Map ctrls;
+		ctrls[&controls::FrameDurationLimits] =
+			ControlInfo(static_cast<int64_t>(33'333),
+				    static_cast<int64_t>(100'000));
+		controlInfo_ = ControlInfoMap(std::move(ctrls), controls::controls);
+	}
+
 	return 0;
 }
 
@@ -321,10 +341,31 @@ void IPU6CameraData::stopStreaming()
 	icamera::camera_device_stop(cameraId_);
 	streaming_ = false;
 
-	/* Drain pending requests */
-	std::lock_guard<std::mutex> lock(queueMutex_);
-	while (!pendingRequests_.empty())
-		pendingRequests_.pop();
+	/*
+	 * Cancel every request that the application already handed us but for
+	 * which the worker thread never delivered a frame. Simply popping them
+	 * leaks them from the base class's queuedRequests_ list and trips the
+	 * "data->queuedRequests_.empty()" assertion in PipelineHandler::stop().
+	 * Move the queue aside first so we don't hold queueMutex_ across the
+	 * completeBuffer()/completeRequest() callbacks — those run application
+	 * code and may try to queue new requests.
+	 */
+	std::queue<Request *> pending;
+	{
+		std::lock_guard<std::mutex> lock(queueMutex_);
+		std::swap(pending, pendingRequests_);
+	}
+
+	while (!pending.empty()) {
+		Request *request = pending.front();
+		pending.pop();
+
+		for (auto &[stream, buffer] : request->buffers()) {
+			buffer->_d()->cancel();
+			pipe()->completeBuffer(request, buffer);
+		}
+		pipe()->completeRequest(request);
+	}
 
 	LOG(IPU6, Info) << "Streaming stopped for camera " << cameraId_;
 }
